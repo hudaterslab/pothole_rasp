@@ -470,6 +470,7 @@ class GpsNmeaRecorder:
                             GPS_RECONNECT_MAX_SEC,
                             GPS_RECONNECT_INITIAL_SEC * (2 ** min(reconnect_attempt - 1, 10)),
                         )
+                        print(f"[GPS WARN] open failed (retry {reconnect_attempt}, {delay:.0f}s 후): {exc}", flush=True)
                         with self.lock:
                             self.transport_errors.append(f"{type(exc).__name__}: {exc}")
                             if len(self.transport_errors) > 20:
@@ -499,6 +500,7 @@ class GpsNmeaRecorder:
                         with self.lock:
                             self.parse_error_count += 1
                 except (OSError, ValueError) as exc:
+                    print(f"[GPS WARN] serial read error, reconnecting: {exc}", flush=True)
                     with self.lock:
                         self.transport_errors.append(f"{type(exc).__name__}: {exc}")
                         if len(self.transport_errors) > 20:
@@ -1019,7 +1021,19 @@ def main():
         gps_session = refresh_gps_session(gps_session, gps_recorder, datetime.now())
         gps_recorder.start()
         while True:
-            gps_session = refresh_gps_session(gps_session, gps_recorder, datetime.now())
+            now_mono = time.monotonic()
+            if now_mono - last_gps_refresh >= 0.2:
+                try:
+                    gps_session = refresh_gps_session(gps_session, gps_recorder, datetime.now())
+                except Exception as e:
+                    print(f"[GPS WARN] refresh 실패: {e}", flush=True)
+                last_gps_refresh = now_mono
+            if now_mono - last_gps_report >= 10.0:  # 3번: 10초마다 GPS 상태 출력
+                st = gps_recorder.stats()
+                print(f"[GPS] connected={gps_recorder.is_connected()} device={st['active_device']} "
+                      f"sentences={st['sentence_count']} valid_fix={st['valid_fix_count']} "
+                      f"last_err={st['transport_errors'][-1:] or '-'}", flush=True)
+                last_gps_report = now_mono
             frame_item = main_buffer.get_and_clear()
             if frame_item is None:
                 time.sleep(0.005)
