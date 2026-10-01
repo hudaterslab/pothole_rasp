@@ -1020,6 +1020,8 @@ def main():
         gps_recorder = GpsNmeaRecorder(GPS_DEVICE, GPS_BAUDRATE, gps_session, GPS_PREFERRED_DEVICE)
         gps_session = refresh_gps_session(gps_session, gps_recorder, datetime.now())
         gps_recorder.start()
+        last_gps_refresh = 0.0
+        last_gps_report = 0.0
         while True:
             now_mono = time.monotonic()
             if now_mono - last_gps_refresh >= 0.2:
