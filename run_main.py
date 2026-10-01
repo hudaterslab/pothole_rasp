@@ -832,7 +832,7 @@ class DeepXPPUModel:
             return []
 
 # --- [5] 데이터 저장 도우미 함수 ---
-def save_detection_data(frame, detections, frame_id, terminal_id="terminal01", root_dir="/mnt/ssd/porthole_runs", *, frame_timestamp, gps_streams=None, gps_session=None, gps_recorder=None):
+def save_detection_data(frame, detections, frame_id, terminal_id="axsprint-rasp-01", root_dir="/mnt/ssd/porthole_runs", *, frame_timestamp, gps_streams=None, gps_session=None, gps_recorder=None):
     now_kst = datetime.now()
     now_utc = datetime.fromtimestamp(frame_timestamp, timezone.utc)
     
