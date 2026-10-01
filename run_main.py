@@ -5,6 +5,7 @@ import subprocess
 import threading
 import time
 import json
+import struct
 from datetime import datetime, timezone, timedelta
 import math
 import select
@@ -30,6 +31,12 @@ ROADOBJ_CLASSES = {
     8: ('Street_Name_Plate', '도로명판', 2),
     10: ('CCTV', '감시카메라(CCTV)', 6)
 }
+
+# --- [1-1] LiDAR 더미 저장 설정 ---
+# 실제 LiDAR 연동 전까지 패킷 없는 빈 PCAP(글로벌 헤더만)을 저장합니다.
+LIDAR_DUMMY_ENABLED = True
+# pcap 글로벌 헤더: magic, v2.4, thiszone, sigfigs, snaplen, linktype(1=Ethernet)
+PCAP_GLOBAL_HEADER = struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, 1)
 
 # --- [2] 비동기 데이터 공유용 버퍼 클래스 ---
 class LatestItemBuffer:
@@ -621,7 +628,10 @@ class GpsTail:
         if self.identity is not None and (
             identity != self.identity or stat.st_size < self.position
         ):
-            raise RuntimeError(f"GPS manifest replaced or truncated: {self.path}")
+            # 파일이 교체/잘림 → 프로그램을 멈추지 않고 처음부터 다시 읽음
+            print(f"[GPS WARN] GPS log replaced/truncated, re-reading: {self.path}", flush=True)
+            self.position = 0
+            self.grouped = {"GGA": [], "RMC": []}
         self.identity = identity
         with self.path.open("rb") as stream:
             stream.seek(self.position)
@@ -701,7 +711,7 @@ class DeepXPPUModel:
         io = InferenceOption()
         engine = InferenceEngine(self.engine_path, io)
         self.engine_pool.put(engine)
-        
+
         self._load_input_shape(engine)
         print(f"[AI] DeepX 모델 로드 완료: {engine_path}")
 
@@ -741,7 +751,7 @@ class DeepXPPUModel:
         if img is None: return []
 
         h_orig, w_orig = img.shape[:2]
-        
+
         # 640x480 입력을 NPU에 맞게 640x640 레터박스(상하 여백) 처리
         if w_orig != self.input_width or h_orig != self.input_height:
             scale = min(self.input_width / w_orig, self.input_height / h_orig)
@@ -762,21 +772,21 @@ class DeepXPPUModel:
         try:
             output_tensor = engine.run([input_tensor])
             raw_dets = self.postprocess_ppu(output_tensor, self.conf_thres, self.iou_thres)
-            
+
             res = []
             for box, score, cls_id in raw_dets:
                 if cls_id not in target_class_map:
                     continue
-                    
+
                 # 레터박스 여백(dw, dh) 제거 및 원래 640x480 좌표로 복원
                 x1 = np.clip((box[0] - dw) / scale, 0, w_orig)
                 y1 = np.clip((box[1] - dh) / scale, 0, h_orig)
                 x2 = np.clip((box[2] - dw) / scale, 0, w_orig)
                 y2 = np.clip((box[3] - dh) / scale, 0, h_orig)
-                
+
                 eng_name, kor_name, cat_id = target_class_map[cls_id]
                 res.append([int(x1), int(y1), int(x2), int(y2), float(score), eng_name, kor_name, int(cat_id)])
-                
+
             return res
         except Exception as e:
             print(f"[AI Error] PPU 추론 실패: {e}")
@@ -832,36 +842,44 @@ class DeepXPPUModel:
             return []
 
 # --- [5] 데이터 저장 도우미 함수 ---
+def write_dummy_pcap(path):
+    """LiDAR 미연동 상태용 더미 PCAP (패킷 없이 글로벌 헤더만 기록)."""
+    with open(path, "wb") as f:
+        f.write(PCAP_GLOBAL_HEADER)
+
 def save_detection_data(frame, detections, frame_id, terminal_id="axsprint-rasp-01", root_dir="/mnt/ssd/porthole_runs", *, frame_timestamp, gps_streams=None, gps_session=None, gps_recorder=None):
     now_kst = datetime.now()
     now_utc = datetime.fromtimestamp(frame_timestamp, timezone.utc)
-    
+
     date_str = now_kst.strftime("%Y%m%d")
     session_str = now_kst.strftime("%Y%m%d_%H%M")
-    
+
     base_dir = os.path.join(root_dir, date_str, session_str)
     frames_dir = os.path.join(base_dir, "frames")
     gps_dir = os.path.join(base_dir, "gps")
     meta_dir = os.path.join(base_dir, "meta")
-    
-    for d in [frames_dir, gps_dir, meta_dir]:
+    lidar_dir = os.path.join(base_dir, "lidar")
+
+    for d in [frames_dir, gps_dir, meta_dir, lidar_dir]:
         os.makedirs(d, exist_ok=True)
-        
-    timestamp_ns = time.time_ns()
+
+    # 명세: 파일명 시각 = 촬영 시각(date_captured)
+    timestamp_ns = int(frame_timestamp * 1e9)
     file_base = f"frame_{timestamp_ns}_{frame_id:08d}"
-    
+
     jpg_filename = f"{file_base}.jpg"
     json_filename = f"{file_base}.json"
-    
+    pcap_filename = f"{file_base}.pcap"
+
     if gps_session is not None:
         gps_session = refresh_gps_session(gps_session, gps_recorder, now_kst)
         gps_streams = gps_session.gps_streams
     lat, lon = get_current_gps_fix(frame_timestamp, gps_streams)
     record_id = f"{terminal_id}/{session_str}/{frame_id}"
-    
+
     categories_dict = {}
     annotations = []
-    
+
     for i, (x1, y1, x2, y2, score, eng_name, kor_name, cat_id) in enumerate(detections):
         categories_dict[cat_id] = eng_name
         w = x2 - x1
@@ -869,38 +887,50 @@ def save_detection_data(frame, detections, frame_id, terminal_id="axsprint-rasp-
         annotations.append({
             "id": i + 1,
             "image_id": 1,
-            "category_id": cat_id, 
+            "category_id": cat_id,
             "confidence": round(float(score), 4),
             "bbox": [int(x1), int(y1), int(w), int(h)],
             "segmentation": [[int(x1), int(y1), int(x2), int(y1), int(x2), int(y2), int(x1), int(y2)]],
             "measurements": {
-                "size": {"length_m": None, "width_m": None, "area_m2": None}, 
+                "size": {"length_m": None, "width_m": None, "area_m2": None},
                 "depth": {"median_cm": None}
             }
         })
-        
+
     categories = [{"id": cid, "name": name} for cid, name in sorted(categories_dict.items())]
-    
+
     images = [{
         "id": 1,
         "width": frame.shape[1],
         "height": frame.shape[0],
         "file_name": jpg_filename,
-        "date_captured": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ") 
+        "date_captured": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
     }]
-        
+
+    jpg_path = os.path.join(frames_dir, jpg_filename)
+    if not cv2.imwrite(jpg_path, frame):
+        print(f"[SAVE WARN] 이미지 저장 실패: {jpg_path}", flush=True)
+        return gps_session
+
+    pcap_files = []
+    if LIDAR_DUMMY_ENABLED:
+        write_dummy_pcap(os.path.join(lidar_dir, pcap_filename))
+        pcap_files.append({"name": pcap_filename})
+
     data = {
         "record_id": record_id,
         "categories": categories,
         "images": images,
         "annotations": annotations,
-        "gps": {"latitude_deg": lat, "longitude_deg": lon}, 
-        "lidar": {"pcap_files": []}
+        "gps": {"latitude_deg": lat, "longitude_deg": lon},
+        "lidar": {"pcap_files": pcap_files}
     }
-    
-    cv2.imwrite(os.path.join(frames_dir, jpg_filename), frame)
-    with open(os.path.join(meta_dir, json_filename), 'w', encoding='utf-8') as f:
+
+    json_path = os.path.join(meta_dir, json_filename)
+    tmp_path = json_path + ".tmp"
+    with open(tmp_path, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, json_path)  # 중간에 끊겨도 반쯤 쓰인 JSON이 남지 않음
     return gps_session
 
 # --- [6] FFmpeg 듀얼 스트림 읽기 ---
@@ -935,14 +965,14 @@ class FFmpegStreamReader(threading.Thread):
         ]
         frame_size = int(self.w * self.h * 1.5)
         pipe = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10**8)
-        
+
         frame_id = 0
         try:
             while self.running:
                 raw_data = read_exact(pipe, frame_size)
                 if not raw_data: break
                 frame_timestamp = time.time() if not self.is_sub else None
-                
+
                 frame_id += 1
                 if self.is_sub and frame_id % 15 != 0:
                     continue
@@ -961,29 +991,29 @@ def ai_worker_loop(pothole_det, roadobj_det, sub_frame_buffer, result_buffer, st
         if frame is None:
             time.sleep(0.005)
             continue
-            
+
         # 모델별 독립 추론 (각자의 Target Map 적용)
         dets_pothole = pothole_det.infer(frame, POTHOLE_CLASSES)
         dets_roadobj = roadobj_det.infer(frame, ROADOBJ_CLASSES)
-        
+
         combined_raw = dets_pothole + dets_roadobj
         scaled_detections = []
         for x1, y1, x2, y2, score, eng_name, kor_name, cat_id in combined_raw:
             sx1, sy1 = int(x1 * scale_x), int(y1 * scale_y)
             sx2, sy2 = int(x2 * scale_x), int(y2 * scale_y)
             scaled_detections.append([sx1, sy1, sx2, sy2, score, eng_name, kor_name, cat_id])
-            
+
         result_buffer.put(scaled_detections)
 
 # --- [8] 메인 파이프라인 ---
 def main():
     W_MAIN, H_MAIN = 1920, 1080
     main_url = "rtsp://admin:Hu924688@192.168.11.64:554/Streaming/Channels/101"
-    
+
     # 서브스트림 해상도 640x480 적용
-    W_SUB, H_SUB = 640, 480  
+    W_SUB, H_SUB = 640, 480
     sub_url = "rtsp://admin:Hu924688@192.168.11.64:554/Streaming/Channels/102"
-    
+
     main_buffer = LatestItemBuffer()
     sub_buffer = LatestItemBuffer()
     result_buffer = LatestItemBuffer()
@@ -991,30 +1021,31 @@ def main():
 
     main_reader = FFmpegStreamReader(main_url, W_MAIN, H_MAIN, main_buffer, is_sub=False)
     main_reader.start()
-    
+
     sub_reader = FFmpegStreamReader(sub_url, W_SUB, H_SUB, sub_buffer, is_sub=True)
     sub_reader.start()
 
     scale_x = W_MAIN / W_SUB
     scale_y = H_MAIN / H_SUB
-    
-    # 2개 모델 초기화
-    ai_pothole = DeepXPPUModel(engine_path="pothole_best_ppu.dxnn", conf_thres=0.35)
-    ai_roadobj = DeepXPPUModel(engine_path="roadobj_ppu.dxnn", conf_thres=0.35)
+
+    # 2개 모델 초기화 (스크립트 위치 기준 절대경로)
+    model_dir = os.path.dirname(os.path.abspath(__file__))
+    ai_pothole = DeepXPPUModel(engine_path=os.path.join(model_dir, "pothole_best_ppu.dxnn"), conf_thres=0.35)
+    ai_roadobj = DeepXPPUModel(engine_path=os.path.join(model_dir, "roadobj_ppu.dxnn"), conf_thres=0.35)
 
     ai_thread = threading.Thread(
-        target=ai_worker_loop, 
-        args=(ai_pothole, ai_roadobj, sub_buffer, result_buffer, stop_event, scale_x, scale_y), 
+        target=ai_worker_loop,
+        args=(ai_pothole, ai_roadobj, sub_buffer, result_buffer, stop_event, scale_x, scale_y),
         daemon=True
     )
     ai_thread.start()
 
     print("듀얼 모델 & 듀얼 스트림(Main: 1080P, Sub: 480P) 모니터링 시작...")
-    
+
     main_frame_count = 0
     last_saved_detections = None
     gps_recorder = None
-    
+
     try:
         gps_session = GpsSession(datetime.now())
         gps_recorder = GpsNmeaRecorder(GPS_DEVICE, GPS_BAUDRATE, gps_session, GPS_PREFERRED_DEVICE)
@@ -1030,7 +1061,7 @@ def main():
                 except Exception as e:
                     print(f"[GPS WARN] refresh 실패: {e}", flush=True)
                 last_gps_refresh = now_mono
-            if now_mono - last_gps_report >= 10.0:  # 3번: 10초마다 GPS 상태 출력
+            if now_mono - last_gps_report >= 10.0:  # 10초마다 GPS 상태 출력
                 st = gps_recorder.stats()
                 print(f"[GPS] connected={gps_recorder.is_connected()} device={st['active_device']} "
                       f"sentences={st['sentence_count']} valid_fix={st['valid_fix_count']} "
@@ -1041,12 +1072,15 @@ def main():
                 time.sleep(0.005)
                 continue
             frame_main, frame_timestamp = frame_item
-                
+
             main_frame_count += 1
             current_detections = result_buffer.get_current() or []
-            
+
             if current_detections and current_detections != last_saved_detections:
-                gps_session = save_detection_data(frame_main.copy(), current_detections, main_frame_count, frame_timestamp=frame_timestamp, gps_session=gps_session, gps_recorder=gps_recorder)
+                try:
+                    gps_session = save_detection_data(frame_main.copy(), current_detections, main_frame_count, frame_timestamp=frame_timestamp, gps_session=gps_session, gps_recorder=gps_recorder)
+                except Exception as e:
+                    print(f"[SAVE WARN] 저장 실패, 계속 진행: {e}", flush=True)
                 last_saved_detections = current_detections
 
             for x1, y1, x2, y2, score, eng_name, kor_name, cat_id in current_detections:
