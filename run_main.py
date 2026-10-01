@@ -6,6 +6,7 @@ import threading
 import time
 import json
 import struct
+import signal
 from datetime import datetime, timezone, timedelta
 import math
 import select
@@ -37,6 +38,17 @@ ROADOBJ_CLASSES = {
 LIDAR_DUMMY_ENABLED = True
 # pcap 글로벌 헤더: magic, v2.4, thiszone, sigfigs, snaplen, linktype(1=Ethernet)
 PCAP_GLOBAL_HEADER = struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, 1)
+
+# --- [1-2] 화면 출력 설정 ---
+# HEADLESS=1 이면 화면 없이 실행, HEADLESS=0 이면 강제 표시.
+# 지정하지 않으면 DISPLAY/WAYLAND_DISPLAY가 없을 때(systemd 서비스 등) 자동으로 화면 없이 실행.
+_headless_env = os.environ.get("HEADLESS", "").strip().lower()
+if _headless_env in ("1", "true", "yes"):
+    SHOW_WINDOW = False
+elif _headless_env in ("0", "false", "no"):
+    SHOW_WINDOW = True
+else:
+    SHOW_WINDOW = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 # --- [2] 비동기 데이터 공유용 버퍼 클래스 ---
 class LatestItemBuffer:
@@ -1019,6 +1031,14 @@ def main():
     result_buffer = LatestItemBuffer()
     stop_event = threading.Event()
 
+    # systemctl stop(SIGTERM) 시에도 finally가 실행되어 GPS 로그가 정상 마감되도록 함
+    def _handle_stop_signal(signum, frame):
+        print(f"[SYS] 종료 신호 수신({signum}), 정리 후 종료합니다.", flush=True)
+        stop_event.set()
+    signal.signal(signal.SIGTERM, _handle_stop_signal)
+    signal.signal(signal.SIGINT, _handle_stop_signal)
+    print(f"[SYS] 화면 출력: {'ON' if SHOW_WINDOW else 'OFF (headless)'}", flush=True)
+
     main_reader = FFmpegStreamReader(main_url, W_MAIN, H_MAIN, main_buffer, is_sub=False)
     main_reader.start()
 
@@ -1053,7 +1073,7 @@ def main():
         gps_recorder.start()
         last_gps_refresh = 0.0
         last_gps_report = 0.0
-        while True:
+        while not stop_event.is_set():
             now_mono = time.monotonic()
             if now_mono - last_gps_refresh >= 0.2:
                 try:
@@ -1083,6 +1103,9 @@ def main():
                     print(f"[SAVE WARN] 저장 실패, 계속 진행: {e}", flush=True)
                 last_saved_detections = current_detections
 
+            if not SHOW_WINDOW:
+                continue
+
             for x1, y1, x2, y2, score, eng_name, kor_name, cat_id in current_detections:
                 display_text = f"{eng_name} ({score:.2f})"
                 cv2.rectangle(frame_main, (x1, y1), (x2, y2), (0, 255, 0), 2)
@@ -1106,7 +1129,8 @@ def main():
                 else:
                     gps_recorder.stop_event.set()  # Thread.start failed; joining is invalid.
         finally:
-            cv2.destroyAllWindows()
+            if SHOW_WINDOW:
+                cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     main()
