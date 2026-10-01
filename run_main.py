@@ -15,20 +15,20 @@ import queue
 from dx_engine import InferenceEngine, InferenceOption
 
 # --- [1] 타겟 클래스 매핑 (2개 모델 분리 및 클래스 한정) ---
-# 형식: YOLO_Index: ('JSON_영문명', '화면_출력용_한글명', 원본_Category_ID)
+# 형식: YOLO_Index: ('JSON_영문명', '화면_출력용_한글명', 데이터_명세_Category_ID)
 
 # 1. pothole_best_ppu.dxnn 모델 (빗물받이 전용)
 POTHOLE_CLASSES = {
-    3: ('Sewer_Road', '빗물받이', 2) # 원본 매핑의 가로재(2) ID를 재사용
+    3: ('Sewer_Road', '빗물받이', 4)
 }
 
 # 2. roadobj_ppu.dxnn 모델 (도로 시설물 5종 전용)
 ROADOBJ_CLASSES = {
-    3: ('Road_Mirror', '도로반사경', 10),
-    4: ('Speed_Bump', '과속방지턱', 11),
-    5: ('Traffic_Signal', '교통신호기', 27),
-    8: ('Street_Name_Plate', '도로명판', 30),
-    10: ('CCTV', '감시카메라(CCTV)', 32)
+    3: ('Road_Mirror', '도로반사경', 7),
+    4: ('Speed_Bump', '과속방지턱', 5),
+    5: ('Traffic_Signal', '교통신호기', 3),
+    8: ('Street_Name_Plate', '도로명판', 2),
+    10: ('CCTV', '감시카메라(CCTV)', 6)
 }
 
 # --- [2] 비동기 데이터 공유용 버퍼 클래스 ---
@@ -877,7 +877,7 @@ def save_detection_data(frame, detections, frame_id, terminal_id="terminal01", r
             }
         })
         
-    categories = [{"id": cid, "name": name} for cid, name in categories_dict.items()]
+    categories = [{"id": cid, "name": name} for cid, name in sorted(categories_dict.items())]
     
     images = [{
         "id": 1,
