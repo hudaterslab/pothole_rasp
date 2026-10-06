@@ -677,7 +677,7 @@ def get_current_gps_fix(frame_timestamp, gps_streams=None):
 class GpsSession:
     """Adapter for source GPS logs/history only; saver owns image/meta folders."""
 
-    def __init__(self, now_kst, root_dir="/mnt/ssd/porthole_runs"):
+    def __init__(self, now_kst, root_dir="/media/hucomputer/DISK/pothole_runs"):
         self.root_dir = root_dir
         self.session_str = now_kst.strftime("%Y%m%d_%H%M")
         gps_dir = os.path.join(root_dir, now_kst.strftime("%Y%m%d"), self.session_str, "gps")
@@ -710,7 +710,7 @@ def refresh_gps_session(session, gps_recorder, now_kst):
 
 # --- [4] 딥엑스 PPU 추론 클래스 (공용) ---
 class DeepXPPUModel:
-    def __init__(self, engine_path, conf_thres=0.3):
+    def __init__(self, engine_path, conf_thres=0.2):
         self.engine_path = engine_path
         self.conf_thres = conf_thres
         self.iou_thres = 0.45
@@ -859,7 +859,7 @@ def write_dummy_pcap(path):
     with open(path, "wb") as f:
         f.write(PCAP_GLOBAL_HEADER)
 
-def save_detection_data(frame, detections, frame_id, terminal_id="axsprint-rasp-01", root_dir="/mnt/ssd/porthole_runs", *, frame_timestamp, gps_streams=None, gps_session=None, gps_recorder=None):
+def save_detection_data(frame, detections, frame_id, terminal_id="axsprint-rasp-01", root_dir="/media/hucomputer/DISK/pothole_runs", *, frame_timestamp, gps_streams=None, gps_session=None, gps_recorder=None):
     now_kst = datetime.now()
     now_utc = datetime.fromtimestamp(frame_timestamp, timezone.utc)
 
@@ -868,11 +868,12 @@ def save_detection_data(frame, detections, frame_id, terminal_id="axsprint-rasp-
 
     base_dir = os.path.join(root_dir, date_str, session_str)
     frames_dir = os.path.join(base_dir, "frames")
+    frames_bbox_dir = os.path.join(base_dir, "frames_bbox")
     gps_dir = os.path.join(base_dir, "gps")
     meta_dir = os.path.join(base_dir, "meta")
     lidar_dir = os.path.join(base_dir, "lidar")
 
-    for d in [frames_dir, gps_dir, meta_dir, lidar_dir]:
+    for d in [frames_dir, frames_bbox_dir, gps_dir, meta_dir, lidar_dir]:
         os.makedirs(d, exist_ok=True)
 
     # 명세: 파일명 시각 = 촬영 시각(date_captured)
@@ -923,6 +924,18 @@ def save_detection_data(frame, detections, frame_id, terminal_id="axsprint-rasp-
     if not cv2.imwrite(jpg_path, frame):
         print(f"[SAVE WARN] 이미지 저장 실패: {jpg_path}", flush=True)
         return gps_session
+
+    bbox_path = os.path.join(frames_bbox_dir, jpg_filename)
+    try:
+        bbox_frame = frame.copy()
+        for x1, y1, x2, y2, score, eng_name, kor_name, cat_id in detections:
+            display_text = f"{eng_name} ({score:.2f})"
+            cv2.rectangle(bbox_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(bbox_frame, display_text, (x1, max(20, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        if not cv2.imwrite(bbox_path, bbox_frame):
+            print(f"[SAVE WARN] bbox 이미지 저장 실패: {bbox_path}", flush=True)
+    except Exception as e:
+        print(f"[SAVE WARN] bbox 이미지 저장 실패: {bbox_path} ({type(e).__name__})", flush=True)
 
     pcap_files = []
     if LIDAR_DUMMY_ENABLED:
@@ -996,6 +1009,24 @@ class FFmpegStreamReader(threading.Thread):
             pipe.terminate()
 
 # --- [7] AI 백그라운드 워커 스레드 ---
+def append_detection_log(detections, root_dir="/media/hucomputer/DISK/pothole_runs"):
+    """Append one row per filtered object, independently of image saving."""
+    if not detections:
+        return
+    detected_at = datetime.now(timezone.utc)
+    now_local = detected_at.astimezone()
+    logs_dir = os.path.join(root_dir, now_local.strftime("%Y%m%d"),
+                            now_local.strftime("%Y%m%d_%H%M"), "logs")
+    lines = [json.dumps({"class_name": det[5], "conf": float(det[4]),
+                         "detected_at": detected_at.isoformat()},
+                        ensure_ascii=False, allow_nan=False) + "\n"
+             for det in detections]
+    os.makedirs(logs_dir, exist_ok=True)
+    with open(os.path.join(logs_dir, "detections.jsonl"), "a", encoding="utf-8") as f:
+        f.writelines(lines)
+        f.flush()
+
+
 def ai_worker_loop(pothole_det, roadobj_det, sub_frame_buffer, result_buffer, stop_event, scale_x, scale_y):
     """Sub(640x480) 프레임에서 추론 후 Main(1080P) 해상도로 매핑합니다."""
     while not stop_event.is_set():
@@ -1015,6 +1046,10 @@ def ai_worker_loop(pothole_det, roadobj_det, sub_frame_buffer, result_buffer, st
             sx2, sy2 = int(x2 * scale_x), int(y2 * scale_y)
             scaled_detections.append([sx1, sy1, sx2, sy2, score, eng_name, kor_name, cat_id])
 
+        try:
+            append_detection_log(scaled_detections)
+        except Exception as e:
+            print(f"[DETECTION LOG WARN] {type(e).__name__}; continuing", flush=True)
         result_buffer.put(scaled_detections)
 
 # --- [8] 메인 파이프라인 ---
@@ -1050,8 +1085,8 @@ def main():
 
     # 2개 모델 초기화 (스크립트 위치 기준 절대경로)
     model_dir = os.path.dirname(os.path.abspath(__file__))
-    ai_pothole = DeepXPPUModel(engine_path=os.path.join(model_dir, "pothole_best_ppu.dxnn"), conf_thres=0.35)
-    ai_roadobj = DeepXPPUModel(engine_path=os.path.join(model_dir, "roadobj_ppu.dxnn"), conf_thres=0.35)
+    ai_pothole = DeepXPPUModel(engine_path=os.path.join(model_dir, "pothole_best_ppu.dxnn"), conf_thres=0.2)
+    ai_roadobj = DeepXPPUModel(engine_path=os.path.join(model_dir, "roadobj_ppu.dxnn"), conf_thres=0.2)
 
     ai_thread = threading.Thread(
         target=ai_worker_loop,
