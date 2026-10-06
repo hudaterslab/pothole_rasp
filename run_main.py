@@ -5,7 +5,6 @@ import subprocess
 import threading
 import time
 import json
-import struct
 import signal
 from datetime import datetime, timezone, timedelta
 import math
@@ -33,11 +32,6 @@ ROADOBJ_CLASSES = {
     10: ('CCTV', '감시카메라(CCTV)', 6)
 }
 
-# --- [1-1] LiDAR 더미 저장 설정 ---
-# 실제 LiDAR 연동 전까지 패킷 없는 빈 PCAP(글로벌 헤더만)을 저장합니다.
-LIDAR_DUMMY_ENABLED = True
-# pcap 글로벌 헤더: magic, v2.4, thiszone, sigfigs, snaplen, linktype(1=Ethernet)
-PCAP_GLOBAL_HEADER = struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, 1)
 
 # --- [1-2] 화면 출력 설정 ---
 # HEADLESS=1 이면 화면 없이 실행, HEADLESS=0 이면 강제 표시.
@@ -858,10 +852,6 @@ class DeepXPPUModel:
             return []
 
 # --- [5] 데이터 저장 도우미 함수 ---
-def write_dummy_pcap(path):
-    """LiDAR 미연동 상태용 더미 PCAP (패킷 없이 글로벌 헤더만 기록)."""
-    with open(path, "wb") as f:
-        f.write(PCAP_GLOBAL_HEADER)
 
 def save_detection_data(frame, detections, frame_id, terminal_id="axsprint-rasp-01", root_dir="/media/hucomputer/DISK/pothole_runs", *, frame_timestamp, gps_streams=None, gps_session=None, gps_recorder=None, session_uploads=None):
     now_kst = datetime.now()
@@ -877,9 +867,7 @@ def save_detection_data(frame, detections, frame_id, terminal_id="axsprint-rasp-
     frames_bbox_dir = os.path.join(base_dir, "frames_bbox")
     gps_dir = os.path.join(base_dir, "gps")
     meta_dir = os.path.join(base_dir, "meta")
-    lidar_dir = os.path.join(base_dir, "lidar")
-
-    for d in [frames_dir, frames_bbox_dir, gps_dir, meta_dir, lidar_dir]:
+    for d in [frames_dir, frames_bbox_dir, gps_dir, meta_dir]:
         os.makedirs(d, exist_ok=True)
 
     # 명세: 파일명 시각 = 촬영 시각(date_captured)
@@ -888,7 +876,6 @@ def save_detection_data(frame, detections, frame_id, terminal_id="axsprint-rasp-
 
     jpg_filename = f"{file_base}.jpg"
     json_filename = f"{file_base}.json"
-    pcap_filename = f"{file_base}.pcap"
 
     if gps_session is not None:
         gps_session = refresh_gps_session(gps_session, gps_recorder, now_kst)
@@ -943,10 +930,6 @@ def save_detection_data(frame, detections, frame_id, terminal_id="axsprint-rasp-
     except Exception as e:
         print(f"[SAVE WARN] bbox 이미지 저장 실패: {bbox_path} ({type(e).__name__})", flush=True)
 
-    pcap_files = []
-    if LIDAR_DUMMY_ENABLED:
-        write_dummy_pcap(os.path.join(lidar_dir, pcap_filename))
-        pcap_files.append({"name": pcap_filename})
 
     data = {
         "record_id": record_id,
@@ -954,7 +937,7 @@ def save_detection_data(frame, detections, frame_id, terminal_id="axsprint-rasp-
         "images": images,
         "annotations": annotations,
         "gps": {"latitude_deg": lat, "longitude_deg": lon},
-        "lidar": {"pcap_files": pcap_files}
+        "lidar": {"pcap_files": []}
     }
 
     json_path = os.path.join(meta_dir, json_filename)
@@ -1111,7 +1094,7 @@ def server_transport_source():
     source = "\n".join(
         inspect.getsource(f)
         for f in [
-            triplet_error,
+            artifact_pair_error,
             validate_manifest,
             clock_stable,
             content_aliases,
@@ -1145,19 +1128,16 @@ MAX_FRAME = 256 * 1024 * 1024
 PROTOCOL = "porthole_artifacts_v4"
 
 
-def triplet_error(files):
-    """Only one same-stem JPEG/JSON/nonempty PCAP may reach the receiver."""
-    if not isinstance(files, dict) or len(files) != 3:
-        return "Upload requires exactly one JPG, one JSON and one PCAP"
+def artifact_pair_error(files):
+    """Only one same-stem JPEG/JSON pair may reach the receiver."""
+    if not isinstance(files, dict) or len(files) != 2:
+        return "Upload requires exactly one JPG and one JSON"
     if any(not isinstance(name, str) for name in files):
         return "Invalid artifact filename"
-    if {Path(name).suffix for name in files} != {".jpg", ".json", ".pcap"}:
-        return "Upload only accepts JPG, JSON and PCAP"
+    if {Path(name).suffix for name in files} != {".jpg", ".json"}:
+        return "Upload only accepts JPG and JSON"
     if len({Path(name).stem for name in files}) != 1:
-        return "JPG, JSON and PCAP must have the same basename"
-    pcap = next(info for name, info in files.items() if Path(name).suffix == ".pcap")
-    if not isinstance(pcap, dict) or type(pcap.get("bytes")) is not int or pcap["bytes"] <= 24:
-        return "Empty PCAP cannot be uploaded"
+        return "JPG and JSON must have the same basename"
     return ""
 
 
@@ -1170,7 +1150,7 @@ def validate_manifest(manifest):
     files = manifest.get("files")
     if not isinstance(files, dict) or not files or len(files) > 4096:
         raise ValueError("Invalid artifact list")
-    error = triplet_error(files)
+    error = artifact_pair_error(files)
     if error:
         raise ValueError(error)
     total = 0
@@ -1183,7 +1163,7 @@ def validate_manifest(manifest):
             or ("\\" in name)
             or ("\x00" in name)
             or (Path(name).name != name)
-            or Path(name).suffix not in (".jpg", ".json", ".pcap")
+            or Path(name).suffix not in (".jpg", ".json")
         ):
             raise ValueError("Invalid artifact filename")
         size = info.get("bytes")
@@ -1278,7 +1258,7 @@ def prepare_upload(source, manifest):
             continue  # Alias content was verified but is sent only once.
         encoded, encoding = raw, "identity"
         # JPEG already has compression. Recompressing it wasted most CPU time.
-        if Path(name).suffix.lower() in (".json", ".pcap") and len(raw) >= 1024:
+        if Path(name).suffix.lower() == ".json" and len(raw) >= 1024:
             compressed = zlib.compress(raw, 1)
             if len(compressed) <= len(raw) - max(256, int(len(raw) * 0.05)):
                 encoded, encoding = compressed, "zlib"
@@ -1379,7 +1359,7 @@ def receive_frame_payload(stream, request, payload_bytes):
     else:
         payload = decode_wire_payload(wire, encoding, payload_bytes)
     # Keep decode time inside receive_gap: do not report compressed bytes as a
-    # complete original JPG/JSON/PCAP payload before they have been restored.
+    # complete original JPG/JSON payload before they have been restored.
     received_wall, received_mono = time.time_ns(), time.monotonic_ns()
     timing = dict(
         server_received_epoch_ns=received_wall,
@@ -1703,17 +1683,16 @@ class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class HttpUploader:
-    """POST one frame's JPG, JSON and PCAP to PORTHOLE_API_URL as multipart/form-data.
+    """POST one frame's JPG and JSON to PORTHOLE_API_URL as multipart/form-data.
 
-    Parts are named jpg, json and pcap; X-Record-Id carries the JSON record_id so
+    Parts are named jpg and json; X-Record-Id carries the JSON record_id so
     the server can drop repeats, and PORTHOLE_API_TOKEN, if set, is sent as a
     Bearer token. 2xx and 409 (already received) count as delivered. Malformed
     requests (400, 413, 415, 422) are permanent; everything else, including
     redirects, counts as a failed send (UploadWorker then drops the frames waiting).
     """
 
-    CONTENT_TYPES = dict(jpg="image/jpeg", json="application/json",
-                         pcap="application/vnd.tcpdump.pcap")
+    CONTENT_TYPES = dict(jpg="image/jpeg", json="application/json")
     PERMANENT_STATUS = frozenset((400, 413, 415, 422))
 
     def __init__(self, options, timeout=60):
@@ -1722,13 +1701,14 @@ class HttpUploader:
 
     def upload(self, source, manifest):
         parts = {}
+        validate_manifest(dict(manifest, _receive_token=uuid.uuid4().hex))
         for name, info in manifest["files"].items():
             data = (Path(source) / name).read_bytes()
             if len(data) != info["bytes"] or hashlib.sha256(data).hexdigest() != info["sha256"]:
                 raise ValueError(f"Artifact changed after commit: {name}")
             parts[Path(name).suffix.lstrip(".").lower()] = (name, data)
         if set(parts) != set(self.CONTENT_TYPES):
-            raise PermanentUploadError("Upload needs exactly one JPG, JSON and PCAP")
+            raise PermanentUploadError("Upload needs exactly one JPG and one JSON")
         record_id = json.loads(parts["json"][1])["record_id"]
         boundary = uuid.uuid4().hex
         body = bytearray()
@@ -1811,8 +1791,8 @@ def terminal_id():
 def upload_options():
     """Upload settings come only from the environment or the sibling .env.
 
-    PORTHOLE_API_URL selects the HTTP API (JPG/JSON/PCAP per the terminal-server
-    data spec); without it the SSH receiver settings are used.
+    PORTHOLE_API_URL selects the HTTP API (JPG/JSON pairs); without it the SSH
+    receiver settings are used.
     """
     bw_kib = int(os.getenv("PORTHOLE_UPLOAD_BW_KIB", "24576"))
     if bw_kib <= 0:
@@ -2002,7 +1982,7 @@ def collector_busy(held):
 
 class RawUploader:
     """Send every finished recording to <PORTHOLE_RAW_DIR>/<date>/<run>/ on the server, as it is
-    on the SSD, oldest first, and the date folders' CSVs whenever they change.
+    on the SSD except PCAP files, oldest first, and the date folders' CSVs whenever they change.
 
     Started with the analysis of the first new frame, so only once the collector records with
     PTP ready; a run in which nothing was recorded (closed before that) is not sent. rsync resumes
@@ -2057,6 +2037,7 @@ class RawUploader:
                           "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4"])
         command = ["setpriv", "--pdeathsig", "KILL",
                    "rsync", "-rt", "--omit-dir-times", "--relative", "--partial-dir=.rsync-partial",
+                   "--exclude=*.[pP][cC][aA][pP]",  # Preserve old local PCAPs, but never send them.
                    "--timeout=600", f"--bwlimit={self.options.bw_kib}", "--stats", "-e", ssh, source,
                    f"{self.options.user}@{self.options.host}:{self.options.destination}/"]
         with tempfile.TemporaryFile("w+") as output:
@@ -2189,24 +2170,24 @@ def discover(root):
 class RawSessionUploader(RawUploader):
     @staticmethod
     def recorded(run):
-        # Target has individual JPG/PCAP files and GPS/detection logs, not PTP manifests.
+        # Target has individual files and GPS/detection logs, not PTP manifests.
         return any(path.is_file() and path.stat().st_size
                    for name in ("frames", "frames_bbox", "meta", "lidar", "gps", "logs")
                    for path in (run / name).glob("*") if path.name != "run_meta.jsonl")
 
 
 def stage_saved_frame(uploader, base_dir, file_base, frame_id):
-    """Copy only a committed source-compatible triplet; never give originals to the dropper."""
+    """Copy only a committed JPG/JSON pair; never give originals to the dropper."""
     if uploader is None or not uploader.accepting():
         return
     folder = None
     try:
         artifacts = [base_dir / sub / (file_base + ext)
-                     for sub, ext in (("frames", ".jpg"), ("meta", ".json"), ("lidar", ".pcap"))]
+                     for sub, ext in (("frames", ".jpg"), ("meta", ".json"))]
         files = {path.name: dict(bytes=path.stat().st_size, sha256=sha(path)) for path in artifacts}
-        reason = triplet_error(files)
+        reason = artifact_pair_error(files)
         if reason:
-            raise ValueError(reason)  # In particular, do NOT pad the existing 24-byte dummy PCAP.
+            raise ValueError(reason)
         key = base_dir.parent.name + "/" + base_dir.name
         staging = UPLOAD_STAGING / key
         staging.mkdir(parents=True, exist_ok=True)
