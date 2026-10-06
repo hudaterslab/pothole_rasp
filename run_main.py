@@ -949,7 +949,7 @@ def save_detection_data(frame, detections, frame_id, terminal_id="axsprint-rasp-
         stage_saved_frame(session_uploads.detections, Path(base_dir), file_base, frame_id)
     return gps_session
 
-# --- [6] FFmpeg 듀얼 스트림 읽기 ---
+# --- [6] FFmpeg 메인 스트림 읽기 ---
 def read_exact(pipe, size):
     data = bytearray(size)
     view = memoryview(data)
@@ -962,13 +962,12 @@ def read_exact(pipe, size):
     return bytes(data)
 
 class FFmpegStreamReader(threading.Thread):
-    def __init__(self, url, width, height, buffer, is_sub=False):
+    def __init__(self, url, width, height, buffer):
         super().__init__(daemon=True)
         self.url = url
         self.w = width
         self.h = height
         self.buffer = buffer
-        self.is_sub = is_sub
         self.running = True
 
     def run(self):
@@ -987,15 +986,16 @@ class FFmpegStreamReader(threading.Thread):
             while self.running:
                 raw_data = read_exact(pipe, frame_size)
                 if not raw_data: break
-                frame_timestamp = time.time() if not self.is_sub else None
+                frame_timestamp = time.time()
 
                 frame_id += 1
-                if self.is_sub and frame_id % 15 != 0:
+                # 기존 추론 주기 유지: 15프레임마다 같은 원본을 추론/저장에 전달.
+                if frame_id % 15 != 0:
                     continue
 
                 yuv = np.frombuffer(raw_data, dtype='uint8').reshape((int(self.h * 1.5), self.w))
                 bgr = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_NV12)
-                self.buffer.put(bgr.copy() if self.is_sub else (bgr.copy(), frame_timestamp))
+                self.buffer.put((frame_id, bgr, frame_timestamp))
         finally:
             pipe.terminate()
 
@@ -1022,24 +1022,33 @@ def append_detection_log(detections, root_dir="/media/hucomputer/DISK/pothole_ru
 
 
 
-def ai_worker_loop(pothole_det, roadobj_det, sub_frame_buffer, result_buffer, stop_event, scale_x, scale_y, session_uploads=None):
-    """Sub(640x480) 프레임에서 추론 후 Main(1080P) 해상도로 매핑합니다."""
+def infer_main_frame(pothole_det, roadobj_det, frame):
+    """원본의 축소본으로 추론하고 같은 원본의 좌표로 복원합니다."""
+    input_width, input_height = 640, 480
+    inference_frame = cv2.resize(frame, (input_width, input_height))
+    scale_x = frame.shape[1] / input_width
+    scale_y = frame.shape[0] / input_height
+    dets_pothole = pothole_det.infer(inference_frame, POTHOLE_CLASSES)
+    dets_roadobj = roadobj_det.infer(inference_frame, ROADOBJ_CLASSES)
+
+    scaled_detections = []
+    for x1, y1, x2, y2, score, eng_name, kor_name, cat_id in dets_pothole + dets_roadobj:
+        sx1, sy1 = int(x1 * scale_x), int(y1 * scale_y)
+        sx2, sy2 = int(x2 * scale_x), int(y2 * scale_y)
+        scaled_detections.append([sx1, sy1, sx2, sy2, score, eng_name, kor_name, cat_id])
+    return scaled_detections
+
+
+def ai_worker_loop(pothole_det, roadobj_det, frame_buffer, result_buffer, stop_event, session_uploads=None):
+    """추론 결과를 해당 원본/프레임 번호/수신 시각과 묶어 전달합니다."""
     while not stop_event.is_set():
-        frame = sub_frame_buffer.get_and_clear()
-        if frame is None:
+        frame_item = frame_buffer.get_and_clear()
+        if frame_item is None:
             time.sleep(0.005)
             continue
 
-        # 모델별 독립 추론 (각자의 Target Map 적용)
-        dets_pothole = pothole_det.infer(frame, POTHOLE_CLASSES)
-        dets_roadobj = roadobj_det.infer(frame, ROADOBJ_CLASSES)
-
-        combined_raw = dets_pothole + dets_roadobj
-        scaled_detections = []
-        for x1, y1, x2, y2, score, eng_name, kor_name, cat_id in combined_raw:
-            sx1, sy1 = int(x1 * scale_x), int(y1 * scale_y)
-            sx2, sy2 = int(x2 * scale_x), int(y2 * scale_y)
-            scaled_detections.append([sx1, sy1, sx2, sy2, score, eng_name, kor_name, cat_id])
+        frame_id, frame, frame_timestamp = frame_item
+        scaled_detections = infer_main_frame(pothole_det, roadobj_det, frame)
 
         try:
             if session_uploads is None:
@@ -1048,7 +1057,7 @@ def ai_worker_loop(pothole_det, roadobj_det, sub_frame_buffer, result_buffer, st
                 session_uploads.log(scaled_detections)
         except Exception as e:
             print(f"[DETECTION LOG WARN] {type(e).__name__}; continuing", flush=True)
-        result_buffer.put(scaled_detections)
+        result_buffer.put((frame_id, frame, frame_timestamp, scaled_detections))
 
 # --- [8] 메인 파이프라인 ---
 # Transfer contract copied from pothole/live_detection@302d7182fdee360a0b733016b88643f2e8026aa9.
@@ -2274,12 +2283,7 @@ def main():
     W_MAIN, H_MAIN = 1920, 1080
     main_url = "rtsp://admin:Hu924688@192.168.11.64:554/Streaming/Channels/101"
 
-    # 서브스트림 해상도 640x480 적용
-    W_SUB, H_SUB = 640, 480
-    sub_url = "rtsp://admin:Hu924688@192.168.11.64:554/Streaming/Channels/102"
-
     main_buffer = LatestItemBuffer()
-    sub_buffer = LatestItemBuffer()
     result_buffer = LatestItemBuffer()
     stop_event = threading.Event()
 
@@ -2291,14 +2295,8 @@ def main():
     signal.signal(signal.SIGINT, _handle_stop_signal)
     print(f"[SYS] 화면 출력: {'ON' if SHOW_WINDOW else 'OFF (headless)'}", flush=True)
 
-    main_reader = FFmpegStreamReader(main_url, W_MAIN, H_MAIN, main_buffer, is_sub=False)
+    main_reader = FFmpegStreamReader(main_url, W_MAIN, H_MAIN, main_buffer)
     main_reader.start()
-
-    sub_reader = FFmpegStreamReader(sub_url, W_SUB, H_SUB, sub_buffer, is_sub=True)
-    sub_reader.start()
-
-    scale_x = W_MAIN / W_SUB
-    scale_y = H_MAIN / H_SUB
 
     # 2개 모델 초기화 (스크립트 위치 기준 절대경로)
     model_dir = os.path.dirname(os.path.abspath(__file__))
@@ -2308,15 +2306,13 @@ def main():
     uploads = SessionUploads()
     ai_thread = threading.Thread(
         target=ai_worker_loop,
-        args=(ai_pothole, ai_roadobj, sub_buffer, result_buffer, stop_event, scale_x, scale_y, uploads),
+        args=(ai_pothole, ai_roadobj, main_buffer, result_buffer, stop_event, uploads),
         daemon=True
     )
     ai_thread.start()
 
-    print("듀얼 모델 & 듀얼 스트림(Main: 1080P, Sub: 480P) 모니터링 시작...")
+    print("듀얼 모델 & 메인 스트림(1080P 원본/480P 축소 추론, 동일 프레임 저장) 모니터링 시작...")
 
-    main_frame_count = 0
-    last_saved_detections = None
     gps_recorder = None
 
     try:
@@ -2344,22 +2340,18 @@ def main():
                       f"sentences={st['sentence_count']} valid_fix={st['valid_fix_count']} "
                       f"last_err={st['transport_errors'][-1:] or '-'}", flush=True)
                 last_gps_report = now_mono
-            frame_item = main_buffer.get_and_clear()
-            if frame_item is None:
+            result_item = result_buffer.get_and_clear()
+            if result_item is None:
                 time.sleep(0.005)
                 continue
-            frame_main, frame_timestamp = frame_item
+            frame_id, frame_main, frame_timestamp, current_detections = result_item
 
-            main_frame_count += 1
-            current_detections = result_buffer.get_current() or []
-
-            if current_detections and current_detections != last_saved_detections:
+            if current_detections:
                 try:
                     with uploads.lock:
-                        gps_session = save_detection_data(frame_main.copy(), current_detections, main_frame_count, terminal_id=terminal_id(), frame_timestamp=frame_timestamp, gps_session=gps_session, gps_recorder=gps_recorder, session_uploads=uploads)
+                        gps_session = save_detection_data(frame_main.copy(), current_detections, frame_id, terminal_id=terminal_id(), frame_timestamp=frame_timestamp, gps_session=gps_session, gps_recorder=gps_recorder, session_uploads=uploads)
                 except Exception as e:
                     print(f"[SAVE WARN] 저장 실패, 계속 진행: {e}", flush=True)
-                last_saved_detections = current_detections
 
             if not SHOW_WINDOW:
                 continue
@@ -2379,7 +2371,6 @@ def main():
     finally:
         stop_event.set()
         main_reader.running = False
-        sub_reader.running = False
         try:
             if gps_recorder is not None:
                 if gps_recorder.thread is None or gps_recorder.thread.ident is not None:
