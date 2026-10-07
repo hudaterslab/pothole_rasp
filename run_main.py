@@ -9,9 +9,11 @@ import signal
 from datetime import datetime, timezone, timedelta
 import math
 import select
+import socket
 from glob import glob
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit
 import queue
 from dx_engine import InferenceEngine, InferenceOption
 
@@ -67,10 +69,12 @@ class LatestItemBuffer:
         with self.lock:
             return self.item
 
-# --- [3] USB serial GNSS (pothole/live_detection d8bfb3c8) ---
-GPS_DEVICE = "auto"
+# --- [3] TCP / USB serial GNSS ---
+GPS_DEVICE = "tcp://192.168.5.1:30719"  # "auto"로 설정하면 기존 USB 자동 탐색 사용.
 GPS_PREFERRED_DEVICE = "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0"
 GPS_BAUDRATE = 115200
+GPS_TCP_CONNECT_TIMEOUT_SEC = 3.0
+GPS_TCP_IDLE_TIMEOUT_SEC = 10.0
 GPS_RECONNECT_INITIAL_SEC = 1.0
 GPS_RECONNECT_MAX_SEC = 30.0
 GPS_SYNC_SEC = 2.0
@@ -259,7 +263,7 @@ def discover_gps_serial_devices(
     return candidates
 
 class GpsNmeaRecorder:
-    """Read USB NMEA asynchronously so GPS latency cannot block camera/LiDAR."""
+    """Read TCP/USB NMEA asynchronously so GPS latency cannot block camera/LiDAR."""
 
     def __init__(
         self,
@@ -278,6 +282,7 @@ class GpsNmeaRecorder:
         self.thread = None
         self.lock = threading.Lock()
         self.fd = None
+        self.tcp_socket = None
         self.sentence_count = 0
         self.checksum_error_count = 0
         self.parse_error_count = 0
@@ -332,6 +337,25 @@ class GpsNmeaRecorder:
         termios.tcflush(fd, termios.TCIFLUSH)
 
     def _open(self):
+        if self.device.startswith("tcp://"):
+            address = urlsplit(self.device)
+            if not address.hostname or address.port is None:
+                raise ValueError("GPS TCP device must be tcp://host:port")
+            connection = socket.create_connection(
+                (address.hostname, address.port), timeout=GPS_TCP_CONNECT_TIMEOUT_SEC,
+            )
+            try:
+                connection.setblocking(False)
+            except OSError:
+                connection.close()
+                raise
+            self.tcp_socket = connection
+            self.fd = connection.fileno()
+            with self.lock:
+                self.active_device = self.device
+            print(f"[GPS] TCP opened: {self.device}", flush=True)
+            return
+
         candidates = discover_gps_serial_devices(
             self.device,
             self.preferred_device,
@@ -362,9 +386,12 @@ class GpsNmeaRecorder:
 
     def _close(self):
         fd, self.fd = self.fd, None
+        connection, self.tcp_socket = self.tcp_socket, None
         with self.lock:
             self.active_device = None
-        if fd is not None:
+        if connection is not None:
+            connection.close()
+        elif fd is not None:
             try:
                 os.close(fd)
             except OSError:
@@ -477,6 +504,7 @@ class GpsNmeaRecorder:
                     try:
                         self._open()
                         reconnect_attempt = 0
+                        last_received = time.monotonic()
                         with self.lock:
                             self.receiver_open_count += 1
                     except (OSError, ValueError, RuntimeError) as exc:
@@ -494,17 +522,23 @@ class GpsNmeaRecorder:
                         continue
 
                 try:
-                    readable, _, _ = select.select([self.fd], [], [], 0.2)
+                    source = self.tcp_socket if self.tcp_socket is not None else self.fd
+                    readable, _, _ = select.select([source], [], [], 0.2)
                     if not readable:
+                        if (self.tcp_socket is not None and
+                                time.monotonic() - last_received >= GPS_TCP_IDLE_TIMEOUT_SEC):
+                            raise TimeoutError("GPS TCP source stopped sending data")
                         # NMEA arrives in one burst per fix. Syncing in the quiet
                         # gap after a burst never delays a sentence's receive time.
                         if time.monotonic() >= next_sync:
                             handle = self._sync(handle)
                             next_sync = time.monotonic() + GPS_SYNC_SEC
                         continue
-                    chunk = os.read(self.fd, 4096)
+                    chunk = (self.tcp_socket.recv(4096) if self.tcp_socket is not None
+                             else os.read(self.fd, 4096))
                     if not chunk:
-                        raise OSError("GPS serial device returned EOF")
+                        raise OSError("GPS source returned EOF")
+                    last_received = time.monotonic()
                     buffer.extend(chunk)
                     while b"\n" in buffer:
                         raw, _, remainder = buffer.partition(b"\n")
@@ -514,8 +548,10 @@ class GpsNmeaRecorder:
                         buffer.clear()
                         with self.lock:
                             self.parse_error_count += 1
+                except BlockingIOError:
+                    continue
                 except (OSError, ValueError) as exc:
-                    print(f"[GPS WARN] serial read error, reconnecting: {exc}", flush=True)
+                    print(f"[GPS WARN] read error, reconnecting: {exc}", flush=True)
                     with self.lock:
                         self.transport_errors.append(f"{type(exc).__name__}: {exc}")
                         if len(self.transport_errors) > 20:
@@ -523,6 +559,7 @@ class GpsNmeaRecorder:
                     self._close()
                     buffer.clear()
                     handle = self._sync(handle)
+                    self.stop_event.wait(GPS_RECONNECT_INITIAL_SEC)
         finally:
             self._close()
             if handle is not None:
@@ -536,11 +573,12 @@ class GpsNmeaRecorder:
                     handle.close()
 
     def is_connected(self) -> bool:
-        """Serial device presence, independent of NMEA traffic or satellite fix."""
+        """Transport presence, independent of NMEA traffic or satellite fix."""
         with self.lock:
             device = self.active_device
             opened = self.fd is not None
-        return bool(opened and device and os.path.exists(device))
+            network = self.tcp_socket is not None
+        return bool(opened and device and (network or os.path.exists(device)))
 
     def stats(self) -> dict:
         with self.lock:
@@ -552,7 +590,8 @@ class GpsNmeaRecorder:
                 "preferred_device": self.preferred_device,
                 "active_device": self.active_device,
                 "candidate_devices": list(self.candidate_devices),
-                "baudrate": self.baudrate,
+                "transport": "tcp" if self.device.startswith("tcp://") else "serial",
+                "baudrate": None if self.device.startswith("tcp://") else self.baudrate,
                 "sentence_count": self.sentence_count,
                 "checksum_error_count": self.checksum_error_count,
                 "parse_error_count": self.parse_error_count,
@@ -1066,7 +1105,6 @@ import hashlib
 import re
 import shlex
 import shutil
-import socket
 import sys
 import tempfile
 import urllib.error
