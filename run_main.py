@@ -470,6 +470,7 @@ class GpsNmeaRecorder:
         text = raw.decode("ascii", errors="replace").strip()
         if not text:
             return handle
+        print(f"[GPS RX] {text}", flush=True)
         record = parse_nmea_sentence(text, received_timestamp)
         record["monotonic_ns"] = time.monotonic_ns()
         with self.lock:
