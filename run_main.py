@@ -1525,6 +1525,42 @@ def serve(target):
         )
 
 
+def _signoz_record_upload_success(kind, completed_ns=None):
+    """Persist confirmed completion locally; monitoring must never fail an upload."""
+    temp_path = None
+    try:
+        import fcntl
+        completed_ns = int(completed_ns or time.time_ns())
+        folder = PROJECT / "var"
+        folder.mkdir(exist_ok=True)
+        state_path = folder / "signoz_last_upload.json"
+        with (folder / "signoz_last_upload.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                previous = json.loads(state_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                previous = {}
+            if completed_ns <= int(previous.get("completed_epoch_ns", 0)):
+                return
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=folder,
+                                             prefix=".signoz-upload-", delete=False) as stream:
+                temp_path = Path(stream.name)
+                json.dump({"completed_epoch_ns": completed_ns, "kind": kind,
+                           "source": "confirmed_upload"}, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temp_path, state_path)
+            temp_path = None
+    except Exception as exc:
+        print(f"[UPLOAD MONITOR] completion state not saved: {type(exc).__name__}", flush=True)
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 class PersistentUploader:
     def __init__(self, options, relative, timeout=60):
         self.options, self.relative, self.timeout = (options, relative, timeout)
@@ -1701,6 +1737,7 @@ class PersistentUploader:
                 raise ValueError("Invalid server persistence receipt")
             result.update(send_timing)
             self._clock_receipt(result, deadline)
+            _signoz_record_upload_success("detection", result["client_ack_epoch_ns"])
             return result
         except Exception:
             self.close()
@@ -1786,6 +1823,8 @@ class HttpUploader:
             if exc.code != 409:
                 raise RuntimeError(f"API upload failed: HTTP {exc.code}: {detail}") from None
             status, text = (409, b"already received")
+        if 200 <= status < 300:
+            _signoz_record_upload_success("detection")
         return dict(
             transport="http_multipart_v1", url=self.options.api_url, record_id=record_id,
             http_status=status, response=text.decode(errors="replace")[:2000],
@@ -2116,6 +2155,9 @@ class RawUploader:
         lines = [line.strip() for line in text.splitlines() if line.strip()]
         error = "" if proc.returncode == 0 else next(
             (line for line in reversed(lines) if line.startswith(("rsync", "ssh"))), lines[-1] if lines else "")
+        transferred = re.search(r"Number of (?:regular )?files transferred: ([\d,]+)", text)
+        if proc.returncode == 0 and transferred and int(transferred.group(1).replace(",", "")) > 0:
+            _signoz_record_upload_success("raw")
         return proc.returncode, None if sent is None else int(sent.group(1).replace(",", "")) / 1e9, error
 
     def reach(self, status, error):

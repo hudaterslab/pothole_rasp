@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+*.dxnn
+.hf_latest_sha
+*.log
+var/
+pothole_runs/

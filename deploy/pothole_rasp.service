@@ -1,0 +1,25 @@
+[Unit]
+Description=Road object detection (DeepX dual model + GPS)
+After=network-online.target
+Wants=network-online.target
+# SSD가 고정 경로에 마운트된 뒤에 시작
+RequiresMountsFor=/media/hucomputer/DISK
+
+[Service]
+User=hucomputer
+SupplementaryGroups=dialout
+WorkingDirectory=/home/hucomputer/pothole_rasp
+ExecStart=/home/hucomputer/dx-runtime/venv-dx-runtime/bin/python3 -u /home/hucomputer/pothole_rasp/run_main.py
+Environment=HEADLESS=1
+Environment=PYTHONUNBUFFERED=1
+Environment=TZ=Asia/Seoul
+# dx_engine 라이브러리 경로가 필요하면 주석 해제
+# Environment=LD_LIBRARY_PATH=/usr/local/lib
+
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

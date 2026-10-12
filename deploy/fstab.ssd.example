@@ -1,0 +1,4 @@
+# Append the matching entry to /etc/fstab; do not replace the whole file.
+# This UUID and uid/gid belong to the hucomputer terminal at 192.168.1.125.
+# Check lsblk -f and id before using this example on another terminal.
+UUID=1815-4525 /media/hucomputer/DISK vfat defaults,nofail,nosuid,nodev,uid=1000,gid=1000,fmask=0133,dmask=0022,utf8,errors=remount-ro,x-systemd.device-timeout=15s 0 0
